@@ -18,7 +18,8 @@ SOCKS5 carries the destination host as a string in every CONNECT request — for
 ## Run
 
 ```bash
-uv run orbwall.py
+uv run orbwall.py            # default port 1080
+uv run orbwall.py --port 1081
 ```
 
 That's it. The PEP 723 header at the top of `orbwall.py` declares the dependencies (`rumps`, `asyncio-socks-server`) and Python version (`>=3.12`); `uv` resolves and runs in an ephemeral environment.
@@ -39,8 +40,7 @@ The same hint is reachable from the menu bar via **Show OrbStack Setup…**.
 
 ## Files
 
-- `orbwall.py` — entry point, PEP 723 deps, menu bar UI, self-init
-- `socks_proxy.py` — `OrbWallFilter` addon (allow/block/prompt logic)
+- `orbwall.py` — everything: PEP 723 deps, filter addon, menu bar UI, self-init
 - `default_allowlist.txt` — seed list copied into `~/.orbwall/allowlist.txt` on first run
 - `~/.orbwall/allowlist.txt` — runtime allowlist; one domain per line; `*.example.com` wildcards
 - `~/.orbwall/blocklist.txt` — runtime blocklist; same format; blocklist beats allowlist

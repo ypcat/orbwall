@@ -5,57 +5,161 @@
 #     "asyncio-socks-server",
 # ]
 # ///
-"""OrbWall menu bar app.
+"""OrbWall — domain-level firewall for OrbStack VMs.
 
-Run with:  uv run orbwall.py
+Run with:  uv run orbwall.py [--port PORT]
 """
 
+import argparse
+import os
+import queue
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import rumps
-from asyncio_socks_server import Server
+from asyncio_socks_server import Addon, Server
 
-from socks_proxy import (
-    ALLOWLIST_PATH,
-    BLOCKLIST_PATH,
-    CONFIG_DIR,
-    OrbWallFilter,
-    _write_set,
-)
 
+# ── paths ────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_ALLOWLIST = SCRIPT_DIR / "default_allowlist.txt"
-PROXY_HOST = "127.0.0.1"
-PROXY_PORT = 1080
+CONFIG_DIR = Path(os.path.expanduser("~/.orbwall"))
+ALLOWLIST_PATH = CONFIG_DIR / "allowlist.txt"
+BLOCKLIST_PATH = CONFIG_DIR / "blocklist.txt"
+
 ICON_IDLE = "\U0001F6E1️"   # 🛡️
 ICON_ALERT = "\U0001F534"        # 🔴
 
-PROXY_HINT = (
-    "Point OrbStack at OrbWall:\n"
-    f"    orb config set network_proxy socks5://{PROXY_HOST}:{PROXY_PORT}\n"
-    "Restore default routing later:\n"
-    "    orb config set network_proxy auto"
-)
 
+# ── list helpers ─────────────────────────────────────────────────────────────
+
+def _read_set(path: Path) -> set:
+    if not path.exists():
+        return set()
+    out = set()
+    for line in path.read_text().splitlines():
+        s = line.strip()
+        if s and not s.startswith("#"):
+            out.add(s.lower())
+    return out
+
+
+def _write_set(path: Path, items: set) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(sorted(items)) + "\n")
+
+
+def _matches(domain: str, pat: str) -> bool:
+    return domain == pat or (
+        pat.startswith("*.") and (domain == pat[2:] or domain.endswith(pat[1:]))
+    )
+
+
+# ── filter addon ─────────────────────────────────────────────────────────────
+
+class OrbWallFilter(Addon):
+    def __init__(self) -> None:
+        super().__init__()
+        self._lock = threading.Lock()
+        self.allowlist = _read_set(ALLOWLIST_PATH)
+        self.blocklist = _read_set(BLOCKLIST_PATH)
+        self.pending: "queue.Queue[str]" = queue.Queue()
+        self._pending_seen: set = set()
+        self.paused = False
+        self.allowed_count = 0
+        self.blocked_count = 0
+        self.recent: list = []
+
+    def check_domain(self, domain: str) -> str:
+        d = domain.lower()
+        with self._lock:
+            if self.paused:
+                return "allow"
+            if any(_matches(d, p) for p in self.blocklist):
+                return "block"
+            if any(_matches(d, p) for p in self.allowlist):
+                return "allow"
+        return "unknown"
+
+    def allow_domain(self, domain: str) -> None:
+        d = domain.lower()
+        with self._lock:
+            self.allowlist.add(d)
+            self.blocklist.discard(d)
+            _write_set(ALLOWLIST_PATH, self.allowlist)
+            _write_set(BLOCKLIST_PATH, self.blocklist)
+            self._pending_seen.discard(d)
+
+    def block_domain(self, domain: str) -> None:
+        d = domain.lower()
+        with self._lock:
+            self.blocklist.add(d)
+            self.allowlist.discard(d)
+            _write_set(ALLOWLIST_PATH, self.allowlist)
+            _write_set(BLOCKLIST_PATH, self.blocklist)
+            self._pending_seen.discard(d)
+
+    def reload_lists(self) -> None:
+        with self._lock:
+            self.allowlist = _read_set(ALLOWLIST_PATH)
+            self.blocklist = _read_set(BLOCKLIST_PATH)
+
+    def set_paused(self, paused: bool) -> None:
+        with self._lock:
+            self.paused = paused
+
+    def pending_snapshot(self) -> list:
+        with self._lock:
+            return sorted(self._pending_seen)
+
+    def _record(self, domain: str, action: str) -> None:
+        with self._lock:
+            self.recent.append((time.time(), domain, action))
+            del self.recent[:-200]
+            if action == "allow":
+                self.allowed_count += 1
+            elif action == "block":
+                self.blocked_count += 1
+
+    def _enqueue_pending(self, domain: str) -> None:
+        d = domain.lower()
+        with self._lock:
+            if d in self._pending_seen:
+                return
+            self._pending_seen.add(d)
+        self.pending.put(d)
+
+    async def on_connect(self, flow):
+        host = str(flow.dst.host)
+        verdict = self.check_domain(host)
+        if verdict == "allow":
+            self._record(host, "allow")
+            return None  # abstain → server proxies directly
+        if verdict == "block":
+            self._record(host, "block")
+            raise ConnectionRefusedError(f"blocked: {host}")
+        self._record(host, "unknown")
+        self._enqueue_pending(host)
+        raise ConnectionRefusedError(f"unknown: {host}")
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def init_config() -> None:
-    """Create ~/.orbwall/ and seed lists on first run."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if not ALLOWLIST_PATH.exists():
-        if DEFAULT_ALLOWLIST.exists():
-            ALLOWLIST_PATH.write_text(DEFAULT_ALLOWLIST.read_text())
-        else:
-            ALLOWLIST_PATH.write_text("")
+        ALLOWLIST_PATH.write_text(
+            DEFAULT_ALLOWLIST.read_text() if DEFAULT_ALLOWLIST.exists() else ""
+        )
     if not BLOCKLIST_PATH.exists():
         BLOCKLIST_PATH.write_text("")
 
 
 def parent_domain(domain: str) -> str:
-    """Best-effort registrable parent (no PSL)."""
     parts = domain.lower().split(".")
     if len(parts) <= 2:
         return domain.lower()
@@ -65,17 +169,21 @@ def parent_domain(domain: str) -> str:
     return ".".join(parts[-2:])
 
 
+# ── menu bar app ─────────────────────────────────────────────────────────────
+
 class OrbWallApp(rumps.App):
-    def __init__(self) -> None:
+    def __init__(self, port: int) -> None:
         super().__init__("OrbWall", title=ICON_IDLE, quit_button=None)
+        self._proxy_host = "127.0.0.1"
+        self._proxy_port = port
         init_config()
+
         self.filter = OrbWallFilter()
         self.server = Server(
-            host=PROXY_HOST, port=PROXY_PORT, addons=[self.filter]
+            host=self._proxy_host, port=self._proxy_port, addons=[self.filter]
         )
-        # Server.run() installs SIGTERM/SIGINT handlers via the asyncio loop,
-        # which only works on the main thread. rumps owns the main thread,
-        # so we run the SOCKS server in a worker and skip signal wiring.
+        # Server.run() wires SIGTERM/SIGINT on the asyncio loop, which only
+        # works from the main thread. rumps owns main, so we disable it.
         self.server._install_signal_handlers = lambda: None
 
         self.status_item = rumps.MenuItem("Status: starting…")
@@ -119,22 +227,29 @@ class OrbWallApp(rumps.App):
             self.quit_item,
         ]
 
-        # Print the OrbStack setup hint to stdout — we don't touch
-        # `orb config` ourselves.
-        print(PROXY_HINT, flush=True)
+        print(self._hint(), flush=True)
 
-        self.server_thread = threading.Thread(
-            target=self._run_server, daemon=True
-        )
+        self.server_thread = threading.Thread(target=self._run_server, daemon=True)
         self.server_thread.start()
 
         self._alert_lock = threading.Lock()
         self._showing_alert = False
 
-        self.pending_timer = rumps.Timer(self.check_pending, 0.5)
-        self.pending_timer.start()
-        self.ui_timer = rumps.Timer(self.refresh_ui, 2.0)
-        self.ui_timer.start()
+        self._timers = [
+            rumps.Timer(self.check_pending, 0.5),
+            rumps.Timer(self.refresh_ui, 2.0),
+        ]
+        for t in self._timers:
+            t.start()
+
+    def _hint(self) -> str:
+        addr = f"socks5://{self._proxy_host}:{self._proxy_port}"
+        return (
+            f"Point OrbStack at OrbWall:\n"
+            f"    orb config set network_proxy {addr}\n"
+            f"Restore default routing later:\n"
+            f"    orb config set network_proxy auto"
+        )
 
     def _run_server(self) -> None:
         try:
@@ -142,7 +257,7 @@ class OrbWallApp(rumps.App):
         except Exception as e:
             print(f"OrbWall proxy error: {e}", file=sys.stderr, flush=True)
 
-    # ---------- timers ----------
+    # ── timers ────────────────────────────────────────────────────────────────
 
     def check_pending(self, _) -> None:
         if self._showing_alert:
@@ -164,46 +279,36 @@ class OrbWallApp(rumps.App):
         self.title = ICON_ALERT if pending_items else ICON_IDLE
 
         paused = self.filter.paused
-        status = "Paused (allow all)" if paused else "Active"
         self.status_item.title = (
-            f"Status: {status} "
-            f"(✓ {self.filter.allowed_count} allowed · "
-            f"✗ {self.filter.blocked_count} blocked)"
+            f"Status: {'Paused (allow all)' if paused else 'Active'} "
+            f"(✓ {self.filter.allowed_count} · ✗ {self.filter.blocked_count})"
         )
-        self.pause_item.title = (
-            "Resume Filtering" if paused else "Pause Filtering"
-        )
+        self.pause_item.title = "Resume Filtering" if paused else "Pause Filtering"
 
         self.pending_menu.title = f"Pending ({len(pending_items)})"
         self.pending_menu.clear()
         for d in pending_items:
             self.pending_menu.add(
-                rumps.MenuItem(
-                    d, callback=lambda _s, dom=d: self.prompt_for(dom)
-                )
+                rumps.MenuItem(d, callback=lambda _s, dom=d: self.prompt_for(dom))
             )
 
         self.recent_menu.clear()
         for _ts, dom, action in reversed(self.filter.recent[-20:]):
-            mark = {"allow": "✓", "block": "✗", "unknown": "?"}.get(action, "·")
+            mark = {"allow": "✓", "block": "✗"}.get(action, "?")
             self.recent_menu.add(rumps.MenuItem(f"{mark} {dom}"))
 
         self.allowed_menu.clear()
         for d in sorted(self.filter.allowlist):
             self.allowed_menu.add(
-                rumps.MenuItem(
-                    d, callback=lambda _s, dom=d: self.remove_allow(dom)
-                )
+                rumps.MenuItem(d, callback=lambda _s, dom=d: self.remove_allow(dom))
             )
         self.blocked_menu.clear()
         for d in sorted(self.filter.blocklist):
             self.blocked_menu.add(
-                rumps.MenuItem(
-                    d, callback=lambda _s, dom=d: self.remove_block(dom)
-                )
+                rumps.MenuItem(d, callback=lambda _s, dom=d: self.remove_block(dom))
             )
 
-    # ---------- alerts ----------
+    # ── alerts ────────────────────────────────────────────────────────────────
 
     def show_domain_alert(self, domain: str) -> None:
         parent = parent_domain(domain)
@@ -218,10 +323,7 @@ class OrbWallApp(rumps.App):
 
         response = rumps.alert(
             title="OrbWall: New Domain",
-            message=(
-                f"'{domain}' is requesting network access.\n\n"
-                "Allow this domain?"
-            ),
+            message=f"'{domain}' is requesting network access.\n\nAllow this domain?",
             ok="Allow",
             cancel="Block",
             other=f"Allow *.{parent}",
@@ -244,7 +346,7 @@ class OrbWallApp(rumps.App):
             with self._alert_lock:
                 self._showing_alert = False
 
-    # ---------- menu callbacks ----------
+    # ── menu callbacks ────────────────────────────────────────────────────────
 
     def toggle_pause(self, _) -> None:
         self.filter.set_paused(not self.filter.paused)
@@ -259,7 +361,7 @@ class OrbWallApp(rumps.App):
         self.filter.reload_lists()
 
     def show_hint(self, _) -> None:
-        rumps.alert(title="OrbStack setup", message=PROXY_HINT, ok="OK")
+        rumps.alert(title="OrbStack setup", message=self._hint(), ok="OK")
 
     def remove_allow(self, domain: str) -> None:
         with self.filter._lock:
@@ -272,8 +374,13 @@ class OrbWallApp(rumps.App):
             _write_set(BLOCKLIST_PATH, self.filter.blocklist)
 
 
+# ── entry point ───────────────────────────────────────────────────────────────
+
 def main() -> None:
-    OrbWallApp().run()
+    parser = argparse.ArgumentParser(description="OrbWall — domain firewall for OrbStack VMs")
+    parser.add_argument("--port", type=int, default=1080, help="SOCKS5 proxy port (default: 1080)")
+    args = parser.parse_args()
+    OrbWallApp(port=args.port).run()
 
 
 if __name__ == "__main__":
