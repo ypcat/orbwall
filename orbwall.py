@@ -8,11 +8,15 @@
 """OrbWall — domain-level firewall for OrbStack VMs.
 
 Run with:  uv run orbwall.py [--port PORT]
+Or one-liner:  uv run https://raw.githubusercontent.com/ypcat/orbwall/main/orbwall.py
 """
 
 import argparse
+import atexit
 import os
 import queue
+import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -23,16 +27,30 @@ import rumps
 from asyncio_socks_server import Addon, Server
 
 
-# ── paths ────────────────────────────────────────────────────────────────────
+# ── paths & constants ────────────────────────────────────────────────────────
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_ALLOWLIST = SCRIPT_DIR / "default_allowlist.txt"
 CONFIG_DIR = Path(os.path.expanduser("~/.orbwall"))
 ALLOWLIST_PATH = CONFIG_DIR / "allowlist.txt"
 BLOCKLIST_PATH = CONFIG_DIR / "blocklist.txt"
 
 ICON_IDLE = "\U0001F6E1️"   # 🛡️
 ICON_ALERT = "\U0001F534"        # 🔴
+
+DEFAULT_ALLOWLIST_TEXT = """\
+# OrbWall default allowlist. One domain per line. Wildcards: *.example.com
+api.anthropic.com
+statsig.anthropic.com
+sentry.io
+*.sentry.io
+registry.npmjs.org
+*.npmjs.org
+pypi.org
+files.pythonhosted.org
+*.pythonhosted.org
+github.com
+*.github.com
+*.githubusercontent.com
+"""
 
 
 # ── list helpers ─────────────────────────────────────────────────────────────
@@ -57,6 +75,67 @@ def _matches(domain: str, pat: str) -> bool:
     return domain == pat or (
         pat.startswith("*.") and (domain == pat[2:] or domain.endswith(pat[1:]))
     )
+
+
+def init_config() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if not ALLOWLIST_PATH.exists():
+        ALLOWLIST_PATH.write_text(DEFAULT_ALLOWLIST_TEXT)
+    if not BLOCKLIST_PATH.exists():
+        BLOCKLIST_PATH.write_text("")
+
+
+def parent_domain(domain: str) -> str:
+    parts = domain.lower().split(".")
+    if len(parts) <= 2:
+        return domain.lower()
+    two_label_tlds = {"co.uk", "ac.uk", "org.uk", "com.au", "co.jp", "co.kr"}
+    if ".".join(parts[-2:]) in two_label_tlds and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+# ── port + orb helpers ───────────────────────────────────────────────────────
+
+def find_free_port(start: int, count: int = 20) -> int:
+    for p in range(start, start + count):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", p))
+                return p
+        except OSError:
+            continue
+    raise RuntimeError(f"no free TCP port in {start}..{start+count-1}")
+
+
+def _orb_available() -> bool:
+    return shutil.which("orb") is not None
+
+
+def orb_get_proxy() -> str | None:
+    if not _orb_available():
+        return None
+    try:
+        r = subprocess.run(
+            ["orb", "config", "get", "network_proxy"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def orb_set_proxy(value: str) -> bool:
+    if not _orb_available():
+        return False
+    try:
+        r = subprocess.run(
+            ["orb", "config", "set", "network_proxy", value],
+            capture_output=True, text=True, timeout=5,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 # ── filter addon ─────────────────────────────────────────────────────────────
@@ -147,43 +226,28 @@ class OrbWallFilter(Addon):
         raise ConnectionRefusedError(f"unknown: {host}")
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-
-def init_config() -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    if not ALLOWLIST_PATH.exists():
-        ALLOWLIST_PATH.write_text(
-            DEFAULT_ALLOWLIST.read_text() if DEFAULT_ALLOWLIST.exists() else ""
-        )
-    if not BLOCKLIST_PATH.exists():
-        BLOCKLIST_PATH.write_text("")
-
-
-def parent_domain(domain: str) -> str:
-    parts = domain.lower().split(".")
-    if len(parts) <= 2:
-        return domain.lower()
-    two_label_tlds = {"co.uk", "ac.uk", "org.uk", "com.au", "co.jp", "co.kr"}
-    if ".".join(parts[-2:]) in two_label_tlds and len(parts) >= 3:
-        return ".".join(parts[-3:])
-    return ".".join(parts[-2:])
-
-
 # ── menu bar app ─────────────────────────────────────────────────────────────
 
 class OrbWallApp(rumps.App):
-    def __init__(self, port: int) -> None:
+    def __init__(self, preferred_port: int) -> None:
         super().__init__("OrbWall", title=ICON_IDLE, quit_button=None)
-        self._proxy_host = "127.0.0.1"
-        self._proxy_port = port
         init_config()
+
+        self._proxy_host = "127.0.0.1"
+        self._proxy_port = find_free_port(preferred_port)
+        self._proxy_url = f"socks5://{self._proxy_host}:{self._proxy_port}"
+
+        # Proxy revert state
+        self._original_orb_proxy: str | None = None
+        self._we_set_orb = False
 
         self.filter = OrbWallFilter()
         self.server = Server(
-            host=self._proxy_host, port=self._proxy_port, addons=[self.filter]
+            host=self._proxy_host, port=self._proxy_port,
+            addons=[self.filter], log_level="WARNING",
         )
-        # Server.run() wires SIGTERM/SIGINT on the asyncio loop, which only
-        # works from the main thread. rumps owns main, so we disable it.
+        # Server.run() installs signal handlers on the asyncio loop, which
+        # only works from the main thread. rumps owns main.
         self.server._install_signal_handlers = lambda: None
 
         self.status_item = rumps.MenuItem("Status: starting…")
@@ -191,21 +255,11 @@ class OrbWallApp(rumps.App):
         self.recent_menu = rumps.MenuItem("Recent")
         self.allowed_menu = rumps.MenuItem("Allowed Domains")
         self.blocked_menu = rumps.MenuItem("Blocked Domains")
-        self.pause_item = rumps.MenuItem(
-            "Pause Filtering", callback=self.toggle_pause
-        )
-        self.edit_allow_item = rumps.MenuItem(
-            "Edit Allowlist", callback=self.edit_allowlist
-        )
-        self.edit_block_item = rumps.MenuItem(
-            "Edit Blocklist", callback=self.edit_blocklist
-        )
-        self.reload_item = rumps.MenuItem(
-            "Reload Lists", callback=self.reload_lists
-        )
-        self.show_hint_item = rumps.MenuItem(
-            "Show OrbStack Setup…", callback=self.show_hint
-        )
+        self.pause_item = rumps.MenuItem("Pause Filtering", callback=self.toggle_pause)
+        self.edit_allow_item = rumps.MenuItem("Edit Allowlist", callback=self.edit_allowlist)
+        self.edit_block_item = rumps.MenuItem("Edit Blocklist", callback=self.edit_blocklist)
+        self.reload_item = rumps.MenuItem("Reload Lists", callback=self.reload_lists)
+        self.configure_orb_item = rumps.MenuItem("Configure OrbStack", callback=self.configure_orb)
         self.quit_item = rumps.MenuItem("Quit", callback=rumps.quit_application)
 
         self.menu = [
@@ -222,12 +276,12 @@ class OrbWallApp(rumps.App):
             self.edit_block_item,
             self.reload_item,
             None,
-            self.show_hint_item,
+            self.configure_orb_item,
             None,
             self.quit_item,
         ]
 
-        print(self._hint(), flush=True)
+        print(f"OrbWall listening on {self._proxy_url}", flush=True)
 
         self.server_thread = threading.Thread(target=self._run_server, daemon=True)
         self.server_thread.start()
@@ -242,14 +296,11 @@ class OrbWallApp(rumps.App):
         for t in self._timers:
             t.start()
 
-    def _hint(self) -> str:
-        addr = f"socks5://{self._proxy_host}:{self._proxy_port}"
-        return (
-            f"Point OrbStack at OrbWall:\n"
-            f"    orb config set network_proxy {addr}\n"
-            f"Restore default routing later:\n"
-            f"    orb config set network_proxy auto"
-        )
+        # One-shot bootstrap: ask to configure OrbStack once the run loop is up.
+        self._bootstrap_timer = rumps.Timer(self._bootstrap, 0.3)
+        self._bootstrap_timer.start()
+
+        atexit.register(self.shutdown)
 
     def _run_server(self) -> None:
         try:
@@ -257,7 +308,61 @@ class OrbWallApp(rumps.App):
         except Exception as e:
             print(f"OrbWall proxy error: {e}", file=sys.stderr, flush=True)
 
-    # ── timers ────────────────────────────────────────────────────────────────
+    # ── bootstrap & shutdown ─────────────────────────────────────────────────
+
+    def _bootstrap(self, sender) -> None:
+        sender.stop()
+        if not _orb_available():
+            print("orb CLI not found — skipping auto-configuration.", flush=True)
+            return
+        self._maybe_configure_orb(initial=True)
+
+    def _maybe_configure_orb(self, initial: bool = False) -> None:
+        current = orb_get_proxy()
+        if current is None:
+            rumps.alert(
+                title="OrbWall",
+                message="Could not read `orb config get network_proxy`. "
+                        "Is OrbStack installed?",
+                ok="OK",
+            )
+            return
+        if current == self._proxy_url:
+            if not initial:
+                rumps.alert(
+                    title="OrbWall",
+                    message=f"OrbStack is already pointing at {self._proxy_url}.",
+                    ok="OK",
+                )
+            return
+
+        response = rumps.alert(
+            title="OrbWall: configure OrbStack?",
+            message=(
+                f"OrbStack network_proxy is currently:\n    {current}\n\n"
+                f"Set it to:\n    {self._proxy_url}\n\n"
+                f"OrbWall will restore the original value on quit."
+            ),
+            ok="Set",
+            cancel="Skip",
+        )
+        if response == 1 and orb_set_proxy(self._proxy_url):
+            self._original_orb_proxy = current
+            self._we_set_orb = True
+            print(f"orb network_proxy: {current} → {self._proxy_url}", flush=True)
+
+    def shutdown(self) -> None:
+        if self._we_set_orb and self._original_orb_proxy is not None:
+            ok = orb_set_proxy(self._original_orb_proxy)
+            print(
+                f"orb network_proxy restored to {self._original_orb_proxy}"
+                if ok else
+                f"failed to restore orb network_proxy to {self._original_orb_proxy}",
+                flush=True,
+            )
+            self._we_set_orb = False
+
+    # ── timers ───────────────────────────────────────────────────────────────
 
     def check_pending(self, _) -> None:
         if self._showing_alert:
@@ -281,6 +386,7 @@ class OrbWallApp(rumps.App):
         paused = self.filter.paused
         self.status_item.title = (
             f"Status: {'Paused (allow all)' if paused else 'Active'} "
+            f"@ :{self._proxy_port} "
             f"(✓ {self.filter.allowed_count} · ✗ {self.filter.blocked_count})"
         )
         self.pause_item.title = "Resume Filtering" if paused else "Pause Filtering"
@@ -308,7 +414,7 @@ class OrbWallApp(rumps.App):
                 rumps.MenuItem(d, callback=lambda _s, dom=d: self.remove_block(dom))
             )
 
-    # ── alerts ────────────────────────────────────────────────────────────────
+    # ── alerts ───────────────────────────────────────────────────────────────
 
     def show_domain_alert(self, domain: str) -> None:
         parent = parent_domain(domain)
@@ -346,7 +452,7 @@ class OrbWallApp(rumps.App):
             with self._alert_lock:
                 self._showing_alert = False
 
-    # ── menu callbacks ────────────────────────────────────────────────────────
+    # ── menu callbacks ───────────────────────────────────────────────────────
 
     def toggle_pause(self, _) -> None:
         self.filter.set_paused(not self.filter.paused)
@@ -360,8 +466,8 @@ class OrbWallApp(rumps.App):
     def reload_lists(self, _) -> None:
         self.filter.reload_lists()
 
-    def show_hint(self, _) -> None:
-        rumps.alert(title="OrbStack setup", message=self._hint(), ok="OK")
+    def configure_orb(self, _) -> None:
+        self._maybe_configure_orb(initial=False)
 
     def remove_allow(self, domain: str) -> None:
         with self.filter._lock:
@@ -374,13 +480,20 @@ class OrbWallApp(rumps.App):
             _write_set(BLOCKLIST_PATH, self.filter.blocklist)
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+# ── entry point ──────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="OrbWall — domain firewall for OrbStack VMs")
-    parser.add_argument("--port", type=int, default=1080, help="SOCKS5 proxy port (default: 1080)")
+    parser.add_argument(
+        "--port", type=int, default=1080,
+        help="Preferred SOCKS5 port (auto-increments if taken). Default: 1080",
+    )
     args = parser.parse_args()
-    OrbWallApp(port=args.port).run()
+    app = OrbWallApp(preferred_port=args.port)
+    try:
+        app.run()
+    finally:
+        app.shutdown()
 
 
 if __name__ == "__main__":

@@ -17,52 +17,46 @@ SOCKS5 carries the destination host as a string in every CONNECT request — for
 
 ## Run
 
-```bash
-uv run orbwall.py            # default port 1080
-uv run orbwall.py --port 1081
-```
-
-That's it. The PEP 723 header at the top of `orbwall.py` declares the dependencies (`rumps`, `asyncio-socks-server`) and Python version (`>=3.12`); `uv` resolves and runs in an ephemeral environment.
-
-On first launch OrbWall:
-
-- creates `~/.orbwall/` with `allowlist.txt` (seeded from `default_allowlist.txt`) and `blocklist.txt`
-- prints the OrbStack setup hint to stdout
-- starts the SOCKS5 server on `127.0.0.1:1080`
-
-OrbWall **does not** modify OrbStack's config for you. Wire it up yourself:
+One-liner (no clone needed):
 
 ```bash
-orb config set network_proxy socks5://127.0.0.1:1080
+uv run https://raw.githubusercontent.com/ypcat/orbwall/main/orbwall.py
 ```
 
-The same hint is reachable from the menu bar via **Show OrbStack Setup…**.
+Or local:
+
+```bash
+uv run orbwall.py
+uv run orbwall.py --port 1081     # preferred port; auto-increments if taken
+```
+
+PEP 723 metadata in the script declares the deps (`rumps`, `asyncio-socks-server`) and Python (`>=3.12`); `uv` resolves and runs in an ephemeral environment.
+
+On launch OrbWall:
+
+1. Creates `~/.orbwall/` with a seeded `allowlist.txt` and empty `blocklist.txt` on first run
+2. Picks a free port starting from `--port` (default 1080)
+3. Starts the SOCKS5 server on `127.0.0.1:<port>`
+4. Reads `orb config get network_proxy` — if it isn't already pointing at OrbWall, asks once via dialog whether to set it. Says yes → OrbWall remembers the previous value and **restores it on quit**.
+
+The same configure prompt is reachable any time from the **Configure OrbStack** menu item.
 
 ## Files
 
-- `orbwall.py` — everything: PEP 723 deps, filter addon, menu bar UI, self-init
-- `default_allowlist.txt` — seed list copied into `~/.orbwall/allowlist.txt` on first run
+- `orbwall.py` — single file: PEP 723 deps, filter addon, menu bar UI, embedded default allowlist
 - `~/.orbwall/allowlist.txt` — runtime allowlist; one domain per line; `*.example.com` wildcards
 - `~/.orbwall/blocklist.txt` — runtime blocklist; same format; blocklist beats allowlist
 
 ## Menu bar
 
-- **Status** — running state and ✓/✗ counters
+- **Status** — running state, port, ✓/✗ counters
 - **Pending** — domains awaiting your decision; click one to re-show the prompt
 - **Recent** — last 20 verdicts
 - **Allowed / Blocked** — current rules; click an entry to remove it
 - **Pause Filtering** — temporarily allow all
 - **Edit Allowlist / Blocklist** — open in default text editor
 - **Reload Lists** — re-read files after manual edits
-- **Show OrbStack Setup…** — re-display the `orb config` hint
-
-## Teardown
-
-```bash
-orb config set network_proxy auto
-```
-
-That's the whole rollback. No pf rules, no kernel state, nothing else to clean.
+- **Configure OrbStack** — set / reset `orb config network_proxy`
 
 ## Protocol coverage
 
@@ -77,5 +71,5 @@ That's the whole rollback. No pf rules, no kernel state, nothing else to clean.
 
 - **Agent connects by raw IP** — the IP shows up as the "host"; you get prompted just like any new domain.
 - **Same new domain hit repeatedly** — deduplicated; one prompt per domain. Subsequent requests fail until you decide.
-- **OrbWall not running** — proxy port is closed; all VM TCP fails. Fail-safe.
+- **OrbWall killed with SIGKILL** — `atexit` doesn't fire, so OrbStack stays pointing at the (now closed) port. Reset manually: `orb config set network_proxy auto`.
 - **Wildcards** — `*.example.com` matches any subdomain (any depth).
