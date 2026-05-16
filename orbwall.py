@@ -220,5 +220,9 @@ class OrbWallApp(rumps.App):
             _write_set(BLOCKLIST_PATH, self.proxy.blocklist)
 
 
-if __name__ == "__main__":
+def main() -> None:
     OrbWallApp().run()
+
+
+if __name__ == "__main__":
+    main()

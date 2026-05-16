@@ -6,8 +6,13 @@ CONFIG_DIR="${HOME}/.orbwall"
 ALLOWLIST="${CONFIG_DIR}/allowlist.txt"
 BLOCKLIST="${CONFIG_DIR}/blocklist.txt"
 
-echo "[1/4] Installing rumps…"
-python3 -m pip install --user --upgrade rumps >/dev/null
+echo "[1/4] Installing dependencies with uv…"
+if ! command -v uv >/dev/null 2>&1; then
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  # shellcheck disable=SC1091
+  source "${HOME}/.cargo/env" 2>/dev/null || export PATH="${HOME}/.local/bin:${PATH}"
+fi
+uv sync
 
 echo "[2/4] Configuring OrbStack to use SOCKS5 proxy on 127.0.0.1:1080…"
 if command -v orb >/dev/null 2>&1; then
@@ -49,7 +54,7 @@ fi
 echo "[4/4] Done."
 echo
 echo "Launch OrbWall with:"
-echo "    python3 orbwall.py"
+echo "    uv run orbwall.py"
 echo
 echo "To disable the firewall later:"
 echo "    orb config set network_proxy auto"

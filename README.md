@@ -19,12 +19,12 @@ SOCKS5 carries the destination domain as a string in every CONNECT request — f
 
 ```bash
 ./setup.sh
-python3 orbwall.py
+uv run orbwall.py
 ```
 
 `setup.sh` does:
 
-1. `pip install --user rumps`
+1. Installs [uv](https://github.com/astral-sh/uv) if not present, then `uv sync`
 2. `orb config set network_proxy socks5://127.0.0.1:1080`
 3. Creates `~/.orbwall/allowlist.txt` (pre-seeded) and `~/.orbwall/blocklist.txt`
 
