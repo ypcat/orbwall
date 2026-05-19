@@ -647,35 +647,40 @@ class OrbWallApp(rumps.App):
         except Exception:
             pass
 
-        # NSAlert.runModal() is invisible in LSUIElement apps without explicit activation.
-        # Temporarily switch to Regular policy so the alert window can come to the front.
+        response = 1002  # default: block on any error
         try:
-            from AppKit import NSApp
-            NSApp.setActivationPolicy_(0)  # NSApplicationActivationPolicyRegular
+            from AppKit import NSAlert, NSApp
+            # Switch to Regular policy so the alert can become frontmost.
+            NSApp.setActivationPolicy_(0)
             NSApp.activateIgnoringOtherApps_(True)
+
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("OrbWall: New Domain")
+            alert.setInformativeText_(
+                f"'{domain}' is requesting network access.\n\nAllow this domain?"
+            )
+            alert.addButtonWithTitle_("Allow")
+            alert.addButtonWithTitle_(f"Allow *.{parent}")
+            alert.addButtonWithTitle_("Block")
+            # NSModalPanelWindowLevel (8) floats above normal app windows.
+            alert.window().setLevel_(8)
+            response = alert.runModal()
         except Exception as e:
-            print(f"activation failed: {e}", file=sys.stderr, flush=True)
+            print(f"alert failed: {e}", file=sys.stderr, flush=True)
+        finally:
+            try:
+                from AppKit import NSApp
+                NSApp.setActivationPolicy_(1)
+            except Exception:
+                pass
 
-        response = rumps.alert(
-            title="OrbWall: New Domain",
-            message=f"'{domain}' is requesting network access.\n\nAllow this domain?",
-            ok="Allow",
-            cancel="Block",
-            other=f"Allow *.{parent}",
-        )
-
-        try:
-            from AppKit import NSApp
-            NSApp.setActivationPolicy_(1)  # NSApplicationActivationPolicyAccessory
-        except Exception:
-            pass
-
-        if response == 1:
+        # NSAlertFirstButtonReturn = 1000
+        if response == 1000:
             self.filter.allow_domain(domain)
-        elif response == 0:
-            self.filter.block_domain(domain)
-        elif response == 2:
+        elif response == 1001:
             self.filter.allow_domain(f"*.{parent}")
+        elif response == 1002:
+            self.filter.block_domain(domain)
 
     def prompt_for(self, domain: str) -> None:
         with self._alert_lock:
