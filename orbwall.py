@@ -53,6 +53,9 @@ files.pythonhosted.org
 github.com
 *.github.com
 *.githubusercontent.com
+*.ubuntu.com
+*.debian.org
+packages.microsoft.com
 """
 
 
@@ -207,6 +210,7 @@ class OrbWallFilter:
                 self.allowed_count += 1
             elif action == "block":
                 self.blocked_count += 1
+                print(f"OrbWall: ✗ {domain}", flush=True)
 
     def remove_allow_domain(self, domain: str) -> None:
         d = domain.lower()
@@ -226,6 +230,7 @@ class OrbWallFilter:
             if d in self._pending_seen:
                 return
             self._pending_seen.add(d)
+        print(f"OrbWall: ? {d} — awaiting approval", flush=True)
         self.pending.put(d)
 
 
@@ -558,7 +563,12 @@ class OrbWallApp(rumps.App):
             )
             return
         if current == self._proxy_url:
-            if not initial:
+            if initial and not self._we_set_orb:
+                # Leftover from a previous run (e.g., crash). Claim it so we restore on quit.
+                self._original_orb_proxy = "auto"
+                self._we_set_orb = True
+                print(f"orb network_proxy already set to {self._proxy_url} — inherited.", flush=True)
+            elif not initial:
                 rumps.alert(
                     title="OrbWall",
                     message=f"OrbStack is already pointing at {self._proxy_url}.",
@@ -762,7 +772,12 @@ def main() -> None:
     signal.set_wakeup_fd(_w)
     def _quit_watcher():
         os.read(_r, 1)
+        # Hard exit if shutdown hangs (e.g. orb CLI slow or blocked).
+        killer = threading.Timer(3.0, lambda: os._exit(130))
+        killer.daemon = True
+        killer.start()
         app.shutdown()
+        killer.cancel()
         os._exit(130)
     threading.Thread(target=_quit_watcher, daemon=True).start()
 
