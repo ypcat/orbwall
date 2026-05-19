@@ -101,6 +101,26 @@ def parent_domain(domain: str) -> str:
     return ".".join(parts[-2:])
 
 
+def _show_alert(title: str, message: str, *buttons: str) -> int:
+    """Floating modal NSAlert. Returns 0-based button index (first button = 0)."""
+    from AppKit import NSAlert, NSApp
+    try:
+        NSApp.setActivationPolicy_(0)
+        NSApp.activateIgnoringOtherApps_(True)
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(title)
+        alert.setInformativeText_(message)
+        for b in buttons:
+            alert.addButtonWithTitle_(b)
+        alert.window().setLevel_(8)  # NSModalPanelWindowLevel — floats above other windows
+        return alert.runModal() - 1000
+    finally:
+        try:
+            NSApp.setActivationPolicy_(1)
+        except Exception:
+            pass
+
+
 # ── port + orb helpers ───────────────────────────────────────────────────────
 
 def find_free_port(start: int, count: int = 20) -> int:
@@ -527,10 +547,24 @@ class OrbWallApp(rumps.App):
     def _bootstrap(self, sender) -> None:
         sender.stop()
 
+        # PyObjCTools.AppHelper.runEventLoop(installInterrupt=True) installs its own
+        # SIGINT/SIGTERM handlers AFTER main() sets ours. Re-establish here so the
+        # _quit_watcher thread can detect Ctrl-C.
+        try:
+            if hasattr(self, "_quit_event"):
+                def _handle_quit(*_):
+                    print("OrbWall: quit signal received", flush=True)
+                    self._quit_event.set()
+                signal.signal(signal.SIGINT, _handle_quit)
+                signal.signal(signal.SIGTERM, _handle_quit)
+        except Exception as e:
+            print(f"OrbWall: signal setup failed: {e}", file=sys.stderr, flush=True)
+
         # Re-establish set_wakeup_fd in case AppKit reset it during run loop startup.
         try:
             if hasattr(self, "_wakeup_w"):
                 signal.set_wakeup_fd(self._wakeup_w)
+                print("OrbWall: set_wakeup_fd re-established", flush=True)
         except Exception:
             pass
 
@@ -562,11 +596,10 @@ class OrbWallApp(rumps.App):
     def _maybe_configure_orb(self, initial: bool = False) -> None:
         current = orb_get_proxy()
         if current is None:
-            rumps.alert(
-                title="OrbWall",
-                message="Could not read `orb config get network_proxy`. "
-                        "Is OrbStack installed?",
-                ok="OK",
+            _show_alert(
+                "OrbWall",
+                "Could not read `orb config get network_proxy`. Is OrbStack installed?",
+                "OK",
             )
             return
         if current == self._proxy_url:
@@ -576,24 +609,23 @@ class OrbWallApp(rumps.App):
                 self._we_set_orb = True
                 print(f"orb network_proxy already set to {self._proxy_url} — inherited.", flush=True)
             elif not initial:
-                rumps.alert(
-                    title="OrbWall",
-                    message=f"OrbStack is already pointing at {self._proxy_url}.",
-                    ok="OK",
+                _show_alert(
+                    "OrbWall",
+                    f"OrbStack is already pointing at {self._proxy_url}.",
+                    "OK",
                 )
             return
 
-        response = rumps.alert(
-            title="OrbWall: configure OrbStack?",
-            message=(
+        response = _show_alert(
+            "OrbWall: configure OrbStack?",
+            (
                 f"OrbStack network_proxy is currently:\n    {current}\n\n"
                 f"Set it to:\n    {self._proxy_url}\n\n"
                 f"OrbWall will restore the original value on quit."
             ),
-            ok="Set",
-            cancel="Skip",
+            "Set", "Skip",
         )
-        if response == 1 and orb_set_proxy(self._proxy_url):
+        if response == 0 and orb_set_proxy(self._proxy_url):
             self._original_orb_proxy = current
             self._we_set_orb = True
             print(f"orb network_proxy: {current} → {self._proxy_url}", flush=True)
@@ -678,39 +710,21 @@ class OrbWallApp(rumps.App):
         except Exception:
             pass
 
-        response = 1002  # default: block on any error
         try:
-            from AppKit import NSAlert, NSApp
-            # Switch to Regular policy so the alert can become frontmost.
-            NSApp.setActivationPolicy_(0)
-            NSApp.activateIgnoringOtherApps_(True)
-
-            alert = NSAlert.alloc().init()
-            alert.setMessageText_("OrbWall: New Domain")
-            alert.setInformativeText_(
-                f"'{domain}' is requesting network access.\n\nAllow this domain?"
+            response = _show_alert(
+                "OrbWall: New Domain",
+                f"'{domain}' is requesting network access.\n\nAllow this domain?",
+                "Allow", f"Allow *.{parent}", "Block",
             )
-            alert.addButtonWithTitle_("Allow")
-            alert.addButtonWithTitle_(f"Allow *.{parent}")
-            alert.addButtonWithTitle_("Block")
-            # NSModalPanelWindowLevel (8) floats above normal app windows.
-            alert.window().setLevel_(8)
-            response = alert.runModal()
         except Exception as e:
             print(f"alert failed: {e}", file=sys.stderr, flush=True)
-        finally:
-            try:
-                from AppKit import NSApp
-                NSApp.setActivationPolicy_(1)
-            except Exception:
-                pass
+            response = 2  # default: block
 
-        # NSAlertFirstButtonReturn = 1000
-        if response == 1000:
+        if response == 0:
             self.filter.allow_domain(domain)
-        elif response == 1001:
+        elif response == 1:
             self.filter.allow_domain(f"*.{parent}")
-        elif response == 1002:
+        else:
             self.filter.block_domain(domain)
 
     def prompt_for(self, domain: str) -> None:
@@ -793,7 +807,9 @@ def main() -> None:
                     os.read(_r, 1)
                 except OSError:
                     pass
+                print("OrbWall: wakeup_fd triggered", flush=True)
                 break
+        print("OrbWall: quitting…", flush=True)
         killer = threading.Timer(3.0, lambda: os._exit(130))
         killer.daemon = True
         killer.start()
