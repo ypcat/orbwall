@@ -506,7 +506,7 @@ class OrbWallApp(rumps.App):
         self.edit_block_item = rumps.MenuItem("Edit Blocklist", callback=self.edit_blocklist)
         self.reload_item = rumps.MenuItem("Reload Lists", callback=self.reload_lists)
         self.configure_orb_item = rumps.MenuItem("Configure OrbStack", callback=self.configure_orb)
-        self.quit_item = rumps.MenuItem("Quit", callback=rumps.quit_application)
+        self.quit_item = rumps.MenuItem("Quit", callback=self._quit_from_menu)
 
         self.menu = [
             self.status_item,
@@ -670,6 +670,13 @@ class OrbWallApp(rumps.App):
                 flush=True,
             )
             self._we_set_orb = False
+
+    def _quit_from_menu(self, _) -> None:
+        # NSApp.terminate_() (called by rumps.quit_application) can exit the process
+        # before Python's atexit or the finally block in main() run. Call shutdown()
+        # explicitly first so the proxy is always restored when quitting from the menu.
+        self.shutdown()
+        rumps.quit_application()
 
     # ── timers ───────────────────────────────────────────────────────────────
 
