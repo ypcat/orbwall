@@ -101,6 +101,36 @@ def parent_domain(domain: str) -> str:
     return ".".join(parts[-2:])
 
 
+def _whois_summary(host: str) -> str:
+    """Run local whois and return up to 3 useful lines, or '' on failure/timeout."""
+    if not shutil.which("whois"):
+        return ""
+    try:
+        try:
+            ipaddress.ip_address(host)
+            target = host
+        except ValueError:
+            target = parent_domain(host)
+        r = subprocess.run(["whois", target], capture_output=True, text=True, timeout=3)
+        want = ("registrant org", "orgname", "netname", "registrar:", "descr:", "country:")
+        seen, out = set(), []
+        for line in r.stdout.splitlines():
+            s = line.strip()
+            low = s.lower()
+            for w in want:
+                if low.startswith(w) and ":" in s:
+                    val = s.split(":", 1)[1].strip()
+                    if val and "REDACTED" not in val.upper() and val not in seen:
+                        seen.add(val)
+                        out.append(s)
+                        break
+            if len(out) >= 3:
+                break
+        return "\n".join(out)
+    except Exception:
+        return ""
+
+
 def _show_alert(title: str, message: str, *buttons: str) -> int:
     """Floating modal NSAlert. Returns 0-based button index (first button = 0)."""
     from AppKit import NSAlert, NSApp
@@ -386,11 +416,11 @@ async def _socks5_serve(
         else:
             effective_host = host
 
-        # Hold unknown connections until user decides (up to 30 s).
+        # Hold unknown connections until user decides (up to 5 min).
         verdict = fltr.check_domain(effective_host)
         if verdict == "unknown":
             fltr._enqueue_pending(effective_host)
-            for _ in range(60):
+            for _ in range(600):
                 await asyncio.sleep(0.5)
                 verdict = fltr.check_domain(effective_host)
                 if verdict != "unknown":
@@ -711,20 +741,34 @@ class OrbWallApp(rumps.App):
             pass
 
         try:
+            ipaddress.ip_address(domain)
+            lookup_url = f"https://ipinfo.io/{domain}"
+        except ValueError:
+            lookup_url = f"https://who.is/whois/{domain}"
+
+        whois_info = _whois_summary(domain)
+        msg = f"'{domain}' is requesting network access."
+        if whois_info:
+            msg += f"\n\n{whois_info}"
+        msg += "\n\nAllow this domain?"
+
+        try:
             response = _show_alert(
-                "OrbWall: New Domain",
-                f"'{domain}' is requesting network access.\n\nAllow this domain?",
-                "Allow", f"Allow *.{parent}", "Block",
+                "OrbWall: New Domain", msg,
+                "Allow", f"Allow *.{parent}", "Look Up", "Block",
             )
         except Exception as e:
             print(f"alert failed: {e}", file=sys.stderr, flush=True)
-            response = 2  # default: block
+            response = 3  # default: block
 
         if response == 0:
             self.filter.allow_domain(domain)
         elif response == 1:
             self.filter.allow_domain(f"*.{parent}")
-        else:
+        elif response == 2:
+            # Open browser for research; domain stays in Pending — click it to decide later.
+            subprocess.Popen(["open", lookup_url])
+        else:  # Block (3) or error
             self.filter.block_domain(domain)
 
     def prompt_for(self, domain: str) -> None:
