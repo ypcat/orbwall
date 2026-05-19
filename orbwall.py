@@ -527,6 +527,13 @@ class OrbWallApp(rumps.App):
     def _bootstrap(self, sender) -> None:
         sender.stop()
 
+        # Re-establish set_wakeup_fd in case AppKit reset it during run loop startup.
+        try:
+            if hasattr(self, "_wakeup_w"):
+                signal.set_wakeup_fd(self._wakeup_w)
+        except Exception:
+            pass
+
         # _nsapp is only available after run() → set icon + menu state here.
         try:
             from AppKit import NSImage
@@ -762,17 +769,31 @@ def main() -> None:
     args = parser.parse_args()
     app = OrbWallApp(preferred_port=args.port)
 
-    # Ctrl-C: AppKit's run loop is C code; signal.set_wakeup_fd is the C-level
-    # mechanism that writes to a pipe when a signal arrives, even inside C extensions.
-    # The write end must be non-blocking (required by set_wakeup_fd).
+    # Ctrl-C: two complementary mechanisms so either one suffices.
+    # 1. set_wakeup_fd: C-level pipe write on any signal, even inside AppKit's run loop.
+    #    Re-established in _bootstrap in case AppKit resets it during startup.
+    # 2. _quit_event: threading.Event set by the Python SIGINT handler as a fallback.
+    # The watcher thread unblocks on either and forces exit within 3 s.
     _r, _w = os.pipe()
     _flags = fcntl.fcntl(_w, fcntl.F_GETFL)
     fcntl.fcntl(_w, fcntl.F_SETFL, _flags | os.O_NONBLOCK)
-    signal.signal(signal.SIGINT, lambda *_: None)
+    _quit_event = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: _quit_event.set())
+    signal.signal(signal.SIGTERM, lambda *_: _quit_event.set())
     signal.set_wakeup_fd(_w)
+    app._wakeup_w = _w      # bootstrap will re-call set_wakeup_fd after run loop starts
+    app._quit_event = _quit_event
+
     def _quit_watcher():
-        os.read(_r, 1)
-        # Hard exit if shutdown hangs (e.g. orb CLI slow or blocked).
+        import select as _sel
+        while not _quit_event.is_set():
+            rr, _, _ = _sel.select([_r], [], [], 0.5)
+            if rr:
+                try:
+                    os.read(_r, 1)
+                except OSError:
+                    pass
+                break
         killer = threading.Timer(3.0, lambda: os._exit(130))
         killer.daemon = True
         killer.start()
