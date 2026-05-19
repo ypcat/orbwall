@@ -2,7 +2,6 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "rumps",
-#     "asyncio-socks-server",
 # ]
 # ///
 """OrbWall — domain-level firewall for OrbStack VMs.
@@ -12,14 +11,17 @@ Or one-liner:  uv run https://raw.githubusercontent.com/ypcat/orbwall/main/orbwa
 """
 
 import argparse
+import asyncio
 import atexit
 import ctypes
 import fcntl
+import ipaddress
 import os
 import queue
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -27,7 +29,6 @@ import time
 from pathlib import Path
 
 import rumps
-from asyncio_socks_server import Addon, Server
 
 
 # ── paths & constants ────────────────────────────────────────────────────────
@@ -142,9 +143,8 @@ def orb_set_proxy(value: str) -> bool:
 
 # ── filter addon ─────────────────────────────────────────────────────────────
 
-class OrbWallFilter(Addon):
+class OrbWallFilter:
     def __init__(self) -> None:
-        super().__init__()
         self._lock = threading.Lock()
         self.allowlist = _read_set(ALLOWLIST_PATH)
         self.blocklist = _read_set(BLOCKLIST_PATH)
@@ -214,18 +214,198 @@ class OrbWallFilter(Addon):
             self._pending_seen.add(d)
         self.pending.put(d)
 
-    async def on_connect(self, flow):
-        host = str(flow.dst.host)
-        verdict = self.check_domain(host)
+
+# ── SOCKS5 proxy ─────────────────────────────────────────────────────────────
+
+_SOCKS5_OK   = bytes([5, 0, 0, 1, 0, 0, 0, 0, 0, 0])  # SUCCEEDED, BND 0.0.0.0:0
+_SOCKS5_DENY = bytes([5, 2, 0, 1, 0, 0, 0, 0, 0, 0])  # CONNECTION NOT ALLOWED
+_TLS_PORTS   = frozenset((443, 8443))
+_HTTP_PORTS  = frozenset((80, 8080))
+_PEEK_PORTS  = _TLS_PORTS | _HTTP_PORTS
+
+
+def _host_from_http(data: bytes) -> str | None:
+    """Extract Host header value from an HTTP/1.x request."""
+    try:
+        for line in data.split(b"\r\n")[1:]:
+            if line.lower().startswith(b"host:"):
+                host = line[5:].strip().decode("ascii", errors="ignore")
+                return host.split(":")[0] if ":" in host else host
+    except Exception:
+        pass
+    return None
+
+
+def _sni_from_hello(data: bytes) -> str | None:
+    """Extract SNI hostname from a TLS ClientHello record."""
+    try:
+        if len(data) < 5 or data[0] != 0x16:
+            return None
+        pos = 43  # record(5) + handshake hdr(4) + client_version(2) + random(32)
+        if pos >= len(data):
+            return None
+        pos += 1 + data[pos]  # skip session_id
+        if pos + 2 > len(data):
+            return None
+        pos += 2 + int.from_bytes(data[pos:pos + 2], "big")  # skip cipher_suites
+        if pos >= len(data):
+            return None
+        pos += 1 + data[pos]  # skip compression_methods
+        if pos + 2 > len(data):
+            return None
+        ext_end = pos + 2 + int.from_bytes(data[pos:pos + 2], "big")
+        pos += 2
+        while pos + 4 <= min(ext_end, len(data)):
+            etype = int.from_bytes(data[pos:pos + 2], "big")
+            elen  = int.from_bytes(data[pos + 2:pos + 4], "big")
+            pos  += 4
+            if etype == 0:  # SNI extension
+                p = pos + 2  # skip server_name_list_length
+                if p + 3 <= len(data) and data[p] == 0:
+                    nlen = int.from_bytes(data[p + 1:p + 3], "big")
+                    if p + 3 + nlen <= len(data):
+                        return data[p + 3:p + 3 + nlen].decode("ascii", errors="ignore")
+                return None
+            pos += elen
+    except Exception:
+        pass
+    return None
+
+
+async def _splice(
+    r_a: asyncio.StreamReader, w_b: asyncio.StreamWriter,
+    r_b: asyncio.StreamReader, w_a: asyncio.StreamWriter,
+) -> None:
+    async def _pipe(r, w):
+        try:
+            while chunk := await r.read(65536):
+                w.write(chunk)
+                await w.drain()
+        except (ConnectionError, asyncio.CancelledError, OSError):
+            pass
+        finally:
+            try:
+                w.close()
+                await w.wait_closed()
+            except Exception:
+                pass
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(_pipe(r_a, w_b))
+        tg.create_task(_pipe(r_b, w_a))
+
+
+async def _socks5_serve(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    fltr: "OrbWallFilter",
+) -> None:
+    try:
+        # Greeting
+        n = (await reader.readexactly(2))[1]
+        await reader.readexactly(n)
+        writer.write(b"\x05\x00")
+        await writer.drain()
+
+        # CONNECT request
+        hdr = await reader.readexactly(4)
+        if hdr[0] != 5 or hdr[1] != 1:
+            writer.write(_SOCKS5_DENY)
+            await writer.drain()
+            return
+
+        atyp = hdr[3]
+        if atyp == 1:
+            host = str(ipaddress.IPv4Address(await reader.readexactly(4)))
+            is_ip = True
+        elif atyp == 4:
+            host = str(ipaddress.IPv6Address(await reader.readexactly(16)))
+            is_ip = True
+        elif atyp == 3:
+            n = (await reader.readexactly(1))[0]
+            host = (await reader.readexactly(n)).decode("ascii")
+            is_ip = False
+        else:
+            writer.write(_SOCKS5_DENY)
+            await writer.drain()
+            return
+
+        port = struct.unpack("!H", await reader.readexactly(2))[0]
+
+        # For IP+known ports: send provisional OK, peek at first bytes for hostname.
+        buffered = b""
+        if is_ip and port in _PEEK_PORTS:
+            writer.write(_SOCKS5_OK)
+            await writer.drain()
+            try:
+                buffered = await asyncio.wait_for(reader.read(4096), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+            if port in _TLS_PORTS:
+                effective_host = _sni_from_hello(buffered) or host
+            else:
+                effective_host = _host_from_http(buffered) or host
+        else:
+            effective_host = host
+
+        # Hold unknown connections until user decides (up to 30 s).
+        verdict = fltr.check_domain(effective_host)
+        if verdict == "unknown":
+            fltr._enqueue_pending(effective_host)
+            for _ in range(60):
+                await asyncio.sleep(0.5)
+                verdict = fltr.check_domain(effective_host)
+                if verdict != "unknown":
+                    break
+
+        peeked = is_ip and port in _PEEK_PORTS
         if verdict == "allow":
-            self._record(host, "allow")
-            return None  # abstain → server proxies directly
-        if verdict == "block":
-            self._record(host, "block")
-            raise ConnectionRefusedError(f"blocked: {host}")
-        self._record(host, "unknown")
-        self._enqueue_pending(host)
-        raise ConnectionRefusedError(f"unknown: {host}")
+            fltr._record(effective_host, "allow")
+            if not peeked:
+                writer.write(_SOCKS5_OK)
+                await writer.drain()
+        else:
+            fltr._record(effective_host, "block")
+            if not peeked:
+                writer.write(_SOCKS5_DENY)
+                await writer.drain()
+            return  # peeked path: client sees TCP RST
+
+        # Connect to real destination and relay.
+        try:
+            remote_r, remote_w = await asyncio.open_connection(host, port)
+        except Exception:
+            return
+        if buffered:
+            remote_w.write(buffered)
+            await remote_w.drain()
+        await _splice(reader, remote_w, remote_r, writer)
+
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+class Socks5Proxy:
+    def __init__(self, host: str, port: int, fltr: "OrbWallFilter") -> None:
+        self._host = host
+        self._port = port
+        self._fltr = fltr
+
+    def run(self) -> None:
+        asyncio.run(self._run())
+
+    async def _run(self) -> None:
+        server = await asyncio.start_server(
+            lambda r, w: _socks5_serve(r, w, self._fltr),
+            self._host, self._port,
+        )
+        async with server:
+            await server.serve_forever()
 
 
 # ── menu bar app ─────────────────────────────────────────────────────────────
@@ -244,13 +424,7 @@ class OrbWallApp(rumps.App):
         self._we_set_orb = False
 
         self.filter = OrbWallFilter()
-        self.server = Server(
-            host=self._proxy_host, port=self._proxy_port,
-            addons=[self.filter], log_level="WARNING",
-        )
-        # Server.run() installs signal handlers on the asyncio loop, which
-        # only works from the main thread. rumps owns main.
-        self.server._install_signal_handlers = lambda: None
+        self.proxy = Socks5Proxy(host=self._proxy_host, port=self._proxy_port, fltr=self.filter)
 
         self.status_item = rumps.MenuItem("Status: starting…")
         # callback=lambda _: None enables the item; without it rumps grays it out
@@ -286,7 +460,7 @@ class OrbWallApp(rumps.App):
 
         print(f"OrbWall listening on {self._proxy_url}", flush=True)
 
-        self.server_thread = threading.Thread(target=self._run_server, daemon=True)
+        self.server_thread = threading.Thread(target=self._run_proxy, daemon=True)
         self.server_thread.start()
 
         self._alert_lock = threading.Lock()
@@ -323,9 +497,9 @@ class OrbWallApp(rumps.App):
             except Exception:
                 pass
 
-    def _run_server(self) -> None:
+    def _run_proxy(self) -> None:
         try:
-            self.server.run()
+            self.proxy.run()
         except Exception as e:
             print(f"OrbWall proxy error: {e}", file=sys.stderr, flush=True)
 
