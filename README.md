@@ -37,7 +37,7 @@ On launch OrbWall:
 1. Creates `~/.orbwall/` with a seeded `allowlist.txt` and empty `blocklist.txt` on first run
 2. Picks a free port starting from `--port` (default 1080)
 3. Starts the SOCKS5 server on `127.0.0.1:<port>`
-4. Reads `orb config get network_proxy` — if it isn't already pointing at OrbWall, asks once via dialog whether to set it. Says yes → OrbWall remembers the previous value and **restores it on quit**.
+4. Reads `orb config get network_proxy` — if it isn't already pointing at OrbWall, asks once via dialog whether to set it. Says yes → OrbWall remembers the previous value and **restores it on quit** (including when quitting from the menu bar).
 
 The same configure prompt is reachable any time from the **Configure OrbStack** menu item.
 
@@ -57,6 +57,18 @@ The same configure prompt is reachable any time from the **Configure OrbStack** 
 - **Edit Allowlist / Blocklist** — open in default text editor
 - **Reload Lists** — re-read files after manual edits
 - **Configure OrbStack** — set / reset `orb config network_proxy`
+
+## Domain alert
+
+When an unknown domain is detected, a floating macOS dialog appears with:
+
+- **whois summary** — Registrar, OrgName, NetName, or Country extracted from the local `whois` command so you can judge the domain without leaving the dialog
+- **Allow** — add to allowlist; pending connections for this domain succeed immediately
+- **Allow \*.parent** — allow all subdomains at once (e.g. `*.npmjs.org`)
+- **Look Up** — opens `who.is` (domains) or `ipinfo.io` (raw IPs) in the browser; domain stays in **Pending** so you can decide after researching
+- **Block** — add to blocklist
+
+Connections to an unknown domain are held for up to 5 minutes while you decide. If the timer expires before a verdict, the connection is dropped.
 
 ## Protocol coverage
 
