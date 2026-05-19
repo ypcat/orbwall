@@ -13,9 +13,12 @@ Or one-liner:  uv run https://raw.githubusercontent.com/ypcat/orbwall/main/orbwa
 
 import argparse
 import atexit
+import ctypes
+import fcntl
 import os
 import queue
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -33,8 +36,7 @@ CONFIG_DIR = Path(os.path.expanduser("~/.orbwall"))
 ALLOWLIST_PATH = CONFIG_DIR / "allowlist.txt"
 BLOCKLIST_PATH = CONFIG_DIR / "blocklist.txt"
 
-ICON_IDLE = "\U0001F6E1️"   # 🛡️
-ICON_ALERT = "\U0001F534"        # 🔴
+ICON = "🔒"
 
 DEFAULT_ALLOWLIST_TEXT = """\
 # OrbWall default allowlist. One domain per line. Wildcards: *.example.com
@@ -230,7 +232,7 @@ class OrbWallFilter(Addon):
 
 class OrbWallApp(rumps.App):
     def __init__(self, preferred_port: int) -> None:
-        super().__init__("OrbWall", title=ICON_IDLE, quit_button=None)
+        super().__init__("OrbWall", title=ICON, quit_button=None)
         init_config()
 
         self._proxy_host = "127.0.0.1"
@@ -251,10 +253,11 @@ class OrbWallApp(rumps.App):
         self.server._install_signal_handlers = lambda: None
 
         self.status_item = rumps.MenuItem("Status: starting…")
-        self.pending_menu = rumps.MenuItem("Pending (0)")
-        self.recent_menu = rumps.MenuItem("Recent")
-        self.allowed_menu = rumps.MenuItem("Allowed Domains")
-        self.blocked_menu = rumps.MenuItem("Blocked Domains")
+        # callback=lambda _: None enables the item; without it rumps grays it out
+        self.pending_menu = rumps.MenuItem("Pending (0)", callback=lambda _: None)
+        self.recent_menu = rumps.MenuItem("Recent", callback=lambda _: None)
+        self.allowed_menu = rumps.MenuItem("Allowed Domains", callback=lambda _: None)
+        self.blocked_menu = rumps.MenuItem("Blocked Domains", callback=lambda _: None)
         self.pause_item = rumps.MenuItem("Pause Filtering", callback=self.toggle_pause)
         self.edit_allow_item = rumps.MenuItem("Edit Allowlist", callback=self.edit_allowlist)
         self.edit_block_item = rumps.MenuItem("Edit Blocklist", callback=self.edit_blocklist)
@@ -302,6 +305,24 @@ class OrbWallApp(rumps.App):
 
         atexit.register(self.shutdown)
 
+    @staticmethod
+    def _safe_clear(mi) -> None:
+        if getattr(mi, "_menu", None) is not None:
+            mi.clear()
+
+    @staticmethod
+    def _ensure_enabled(mi) -> None:
+        """Force-enable a submenu parent item and disable auto-validation on its submenu."""
+        try:
+            mi._menuitem.setEnabled_(True)
+        except Exception:
+            pass
+        if getattr(mi, "_menu", None) is not None:
+            try:
+                mi._menu.setAutoenablesItems_(False)
+            except Exception:
+                pass
+
     def _run_server(self) -> None:
         try:
             self.server.run()
@@ -312,6 +333,27 @@ class OrbWallApp(rumps.App):
 
     def _bootstrap(self, sender) -> None:
         sender.stop()
+
+        # _nsapp is only available after run() → set icon + menu state here.
+        try:
+            from AppKit import NSImage
+            img = NSImage.imageWithSystemSymbolName_accessibilityDescription_("lock.fill", None)
+            if img:
+                img.setTemplate_(True)
+                self._nsapp.nsstatusitem.setImage_(img)
+                self._nsapp.nsstatusitem.setTitle_("")
+        except Exception as e:
+            print(f"SF Symbol icon setup failed: {e}", file=sys.stderr, flush=True)
+
+        # Disable macOS responder-chain auto-validation, which grays items in LSUIElement apps.
+        try:
+            self._nsapp.nsstatusitem.menu().setAutoenablesItems_(False)
+        except Exception as e:
+            print(f"setAutoenablesItems_ failed: {e}", file=sys.stderr, flush=True)
+
+        for mi in [self.pending_menu, self.recent_menu, self.allowed_menu, self.blocked_menu]:
+            self._ensure_enabled(mi)
+
         if not _orb_available():
             print("orb CLI not found — skipping auto-configuration.", flush=True)
             return
@@ -381,7 +423,6 @@ class OrbWallApp(rumps.App):
 
     def refresh_ui(self, _) -> None:
         pending_items = self.filter.pending_snapshot()
-        self.title = ICON_ALERT if pending_items else ICON_IDLE
 
         paused = self.filter.paused
         self.status_item.title = (
@@ -392,27 +433,32 @@ class OrbWallApp(rumps.App):
         self.pause_item.title = "Resume Filtering" if paused else "Pause Filtering"
 
         self.pending_menu.title = f"Pending ({len(pending_items)})"
-        self.pending_menu.clear()
+        self._safe_clear(self.pending_menu)
         for d in pending_items:
             self.pending_menu.add(
                 rumps.MenuItem(d, callback=lambda _s, dom=d: self.prompt_for(dom))
             )
+        self._ensure_enabled(self.pending_menu)
 
-        self.recent_menu.clear()
+        self._safe_clear(self.recent_menu)
         for _ts, dom, action in reversed(self.filter.recent[-20:]):
             mark = {"allow": "✓", "block": "✗"}.get(action, "?")
             self.recent_menu.add(rumps.MenuItem(f"{mark} {dom}"))
+        self._ensure_enabled(self.recent_menu)
 
-        self.allowed_menu.clear()
+        self._safe_clear(self.allowed_menu)
         for d in sorted(self.filter.allowlist):
             self.allowed_menu.add(
                 rumps.MenuItem(d, callback=lambda _s, dom=d: self.remove_allow(dom))
             )
-        self.blocked_menu.clear()
+        self._ensure_enabled(self.allowed_menu)
+
+        self._safe_clear(self.blocked_menu)
         for d in sorted(self.filter.blocklist):
             self.blocked_menu.add(
                 rumps.MenuItem(d, callback=lambda _s, dom=d: self.remove_block(dom))
             )
+        self._ensure_enabled(self.blocked_menu)
 
     # ── alerts ───────────────────────────────────────────────────────────────
 
@@ -427,6 +473,15 @@ class OrbWallApp(rumps.App):
         except Exception:
             pass
 
+        # NSAlert.runModal() is invisible in LSUIElement apps without explicit activation.
+        # Temporarily switch to Regular policy so the alert window can come to the front.
+        try:
+            from AppKit import NSApp
+            NSApp.setActivationPolicy_(0)  # NSApplicationActivationPolicyRegular
+            NSApp.activateIgnoringOtherApps_(True)
+        except Exception as e:
+            print(f"activation failed: {e}", file=sys.stderr, flush=True)
+
         response = rumps.alert(
             title="OrbWall: New Domain",
             message=f"'{domain}' is requesting network access.\n\nAllow this domain?",
@@ -434,6 +489,13 @@ class OrbWallApp(rumps.App):
             cancel="Block",
             other=f"Allow *.{parent}",
         )
+
+        try:
+            from AppKit import NSApp
+            NSApp.setActivationPolicy_(1)  # NSApplicationActivationPolicyAccessory
+        except Exception:
+            pass
+
         if response == 1:
             self.filter.allow_domain(domain)
         elif response == 0:
@@ -483,6 +545,16 @@ class OrbWallApp(rumps.App):
 # ── entry point ──────────────────────────────────────────────────────────────
 
 def main() -> None:
+    try:
+        ctypes.CDLL(None).setprogname(b"orbwall")
+    except Exception:
+        pass
+    try:
+        from Foundation import NSProcessInfo
+        NSProcessInfo.processInfo().setProcessName_("orbwall")
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(description="OrbWall — domain firewall for OrbStack VMs")
     parser.add_argument(
         "--port", type=int, default=1080,
@@ -490,6 +562,21 @@ def main() -> None:
     )
     args = parser.parse_args()
     app = OrbWallApp(preferred_port=args.port)
+
+    # Ctrl-C: AppKit's run loop is C code; signal.set_wakeup_fd is the C-level
+    # mechanism that writes to a pipe when a signal arrives, even inside C extensions.
+    # The write end must be non-blocking (required by set_wakeup_fd).
+    _r, _w = os.pipe()
+    _flags = fcntl.fcntl(_w, fcntl.F_GETFL)
+    fcntl.fcntl(_w, fcntl.F_SETFL, _flags | os.O_NONBLOCK)
+    signal.signal(signal.SIGINT, lambda *_: None)
+    signal.set_wakeup_fd(_w)
+    def _quit_watcher():
+        os.read(_r, 1)
+        app.shutdown()
+        os._exit(130)
+    threading.Thread(target=_quit_watcher, daemon=True).start()
+
     try:
         app.run()
     finally:
