@@ -8,12 +8,12 @@ OrbWall is a macOS menu bar app that filters every TCP connection an OrbStack VM
 
 ```
 Orb VM  ──►  orb config network_proxy = socks5://127.0.0.1:1080  ──►  OrbWall (host)
-                                                                     ├─ SOCKS5 server (asyncio-socks-server)
-                                                                     ├─ OrbWallFilter addon → allow / block / prompt
+                                                                     ├─ SOCKS5 server (custom asyncio)
+                                                                     ├─ OrbWallFilter → allow / block / prompt
                                                                      └─ menu bar UI (rumps)
 ```
 
-SOCKS5 carries the destination host as a string in every CONNECT request — for HTTP, HTTPS, SSH, git, raw TCP, anything. OrbWall reads it, checks the lists, and either lets the server proxy through or raises to reject.
+OrbStack resolves DNS before forwarding, so SOCKS5 CONNECT arrives with a raw IP. For HTTPS (port 443) OrbWall peeks at the TLS ClientHello to extract the SNI hostname; for HTTP (port 80) it reads the `Host:` header. The hostname is then checked against the lists.
 
 ## Run
 
@@ -30,7 +30,7 @@ uv run orbwall.py
 uv run orbwall.py --port 1081     # preferred port; auto-increments if taken
 ```
 
-PEP 723 metadata in the script declares the deps (`rumps`, `asyncio-socks-server`) and Python (`>=3.12`); `uv` resolves and runs in an ephemeral environment.
+PEP 723 metadata in the script declares the dep (`rumps`) and Python (`>=3.12`); `uv` resolves and runs in an ephemeral environment.
 
 On launch OrbWall:
 
@@ -69,7 +69,7 @@ The same configure prompt is reachable any time from the **Configure OrbStack** 
 
 ## Edge cases
 
-- **Agent connects by raw IP** — the IP shows up as the "host"; you get prompted just like any new domain.
+- **Agent connects by raw IP** — OrbStack always sends raw IPs via SOCKS5. OrbWall peeks at SNI/Host headers to recover the hostname. If it can't (non-HTTP/S port), the raw IP is shown in the prompt.
 - **Same new domain hit repeatedly** — deduplicated; one prompt per domain. Subsequent requests fail until you decide.
 - **OrbWall killed with SIGKILL** — `atexit` doesn't fire, so OrbStack stays pointing at the (now closed) port. Reset manually: `orb config set network_proxy auto`.
 - **Wildcards** — `*.example.com` matches any subdomain (any depth).

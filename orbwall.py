@@ -174,6 +174,8 @@ class OrbWallFilter:
             _write_set(ALLOWLIST_PATH, self.allowlist)
             _write_set(BLOCKLIST_PATH, self.blocklist)
             self._pending_seen.discard(d)
+            if d.startswith("*."):
+                self._pending_seen = {p for p in self._pending_seen if not _matches(p, d)}
 
     def block_domain(self, domain: str) -> None:
         d = domain.lower()
@@ -205,6 +207,18 @@ class OrbWallFilter:
                 self.allowed_count += 1
             elif action == "block":
                 self.blocked_count += 1
+
+    def remove_allow_domain(self, domain: str) -> None:
+        d = domain.lower()
+        with self._lock:
+            self.allowlist.discard(d)
+            _write_set(ALLOWLIST_PATH, self.allowlist)
+
+    def remove_block_domain(self, domain: str) -> None:
+        d = domain.lower()
+        with self._lock:
+            self.blocklist.discard(d)
+            _write_set(BLOCKLIST_PATH, self.blocklist)
 
     def _enqueue_pending(self, domain: str) -> None:
         d = domain.lower()
@@ -585,7 +599,7 @@ class OrbWallApp(rumps.App):
             return
         try:
             domain = self.filter.pending.get_nowait()
-        except Exception:
+        except queue.Empty:
             return
         with self._alert_lock:
             self._showing_alert = True
@@ -711,14 +725,10 @@ class OrbWallApp(rumps.App):
         self._maybe_configure_orb(initial=False)
 
     def remove_allow(self, domain: str) -> None:
-        with self.filter._lock:
-            self.filter.allowlist.discard(domain)
-            _write_set(ALLOWLIST_PATH, self.filter.allowlist)
+        self.filter.remove_allow_domain(domain)
 
     def remove_block(self, domain: str) -> None:
-        with self.filter._lock:
-            self.filter.blocklist.discard(domain)
-            _write_set(BLOCKLIST_PATH, self.filter.blocklist)
+        self.filter.remove_block_domain(domain)
 
 
 # ── entry point ──────────────────────────────────────────────────────────────
