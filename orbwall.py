@@ -480,7 +480,7 @@ class Socks5Proxy:
 # ── menu bar app ─────────────────────────────────────────────────────────────
 
 class OrbWallApp(rumps.App):
-    def __init__(self, preferred_port: int) -> None:
+    def __init__(self, preferred_port: int, auto_set_proxy: bool = False) -> None:
         super().__init__("OrbWall", title=ICON, quit_button=None)
         init_config()
 
@@ -491,6 +491,7 @@ class OrbWallApp(rumps.App):
         # Proxy revert state
         self._original_orb_proxy: str | None = None
         self._we_set_orb = False
+        self._auto_set_proxy = auto_set_proxy
 
         self.filter = OrbWallFilter()
         self.proxy = Socks5Proxy(host=self._proxy_host, port=self._proxy_port, fltr=self.filter)
@@ -646,16 +647,20 @@ class OrbWallApp(rumps.App):
                 )
             return
 
-        response = _show_alert(
-            "OrbWall: configure OrbStack?",
-            (
-                f"OrbStack network_proxy is currently:\n    {current}\n\n"
-                f"Set it to:\n    {self._proxy_url}\n\n"
-                f"OrbWall will restore the original value on quit."
-            ),
-            "Set", "Skip",
-        )
-        if response == 0 and orb_set_proxy(self._proxy_url):
+        if self._auto_set_proxy:
+            confirmed = True
+        else:
+            response = _show_alert(
+                "OrbWall: configure OrbStack?",
+                (
+                    f"OrbStack network_proxy is currently:\n    {current}\n\n"
+                    f"Set it to:\n    {self._proxy_url}\n\n"
+                    f"OrbWall will restore the original value on quit."
+                ),
+                "Set", "Skip",
+            )
+            confirmed = response == 0
+        if confirmed and orb_set_proxy(self._proxy_url):
             self._original_orb_proxy = current
             self._we_set_orb = True
             print(f"orb network_proxy: {current} → {self._proxy_url}", flush=True)
@@ -831,8 +836,12 @@ def main() -> None:
         "--port", type=int, default=1080,
         help="Preferred SOCKS5 port (auto-increments if taken). Default: 1080",
     )
+    parser.add_argument(
+        "--set-proxy", action="store_true",
+        help="Automatically set the OrbStack network proxy without confirmation.",
+    )
     args = parser.parse_args()
-    app = OrbWallApp(preferred_port=args.port)
+    app = OrbWallApp(preferred_port=args.port, auto_set_proxy=args.set_proxy)
 
     # Ctrl-C: two complementary mechanisms so either one suffices.
     # 1. set_wakeup_fd: C-level pipe write on any signal, even inside AppKit's run loop.
