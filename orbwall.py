@@ -535,6 +535,7 @@ class OrbWallApp(rumps.App):
 
         self._alert_lock = threading.Lock()
         self._showing_alert = False
+        self._menu_state = None
 
         self._timers = [
             rumps.Timer(self.check_pending, 0.5),
@@ -552,6 +553,15 @@ class OrbWallApp(rumps.App):
     @staticmethod
     def _safe_clear(mi) -> None:
         if getattr(mi, "_menu", None) is not None:
+            # rumps pins every MenuItem in NSApp._ns_to_py_and_callback and never
+            # removes it on clear() — purge our children or each rebuild leaks
+            # an NSMenuItem + wrapper + callback closure permanently.
+            try:
+                registry = rumps.rumps.NSApp._ns_to_py_and_callback
+                for child in mi.values():
+                    registry.pop(child._menuitem, None)
+            except Exception:
+                pass
             mi.clear()
 
     @staticmethod
@@ -711,6 +721,15 @@ class OrbWallApp(rumps.App):
         )
         self.pause_item.title = "Resume Filtering" if paused else "Pause Filtering"
 
+        # Rebuilding submenus allocates NSMenuItems — skip when nothing changed.
+        recent_items = self.filter.recent[-20:]
+        allowed_items = sorted(self.filter.allowlist)
+        blocked_items = sorted(self.filter.blocklist)
+        state = (pending_items, recent_items, allowed_items, blocked_items)
+        if state == self._menu_state:
+            return
+        self._menu_state = state
+
         self.pending_menu.title = f"Pending ({len(pending_items)})"
         self._safe_clear(self.pending_menu)
         for d in pending_items:
@@ -720,20 +739,20 @@ class OrbWallApp(rumps.App):
         self._ensure_enabled(self.pending_menu)
 
         self._safe_clear(self.recent_menu)
-        for _ts, dom, action in reversed(self.filter.recent[-20:]):
+        for _ts, dom, action in reversed(recent_items):
             mark = {"allow": "✓", "block": "✗"}.get(action, "?")
             self.recent_menu.add(rumps.MenuItem(f"{mark} {dom}"))
         self._ensure_enabled(self.recent_menu)
 
         self._safe_clear(self.allowed_menu)
-        for d in sorted(self.filter.allowlist):
+        for d in allowed_items:
             self.allowed_menu.add(
                 rumps.MenuItem(d, callback=lambda _s, dom=d: self.remove_allow(dom))
             )
         self._ensure_enabled(self.allowed_menu)
 
         self._safe_clear(self.blocked_menu)
-        for d in sorted(self.filter.blocklist):
+        for d in blocked_items:
             self.blocked_menu.add(
                 rumps.MenuItem(d, callback=lambda _s, dom=d: self.remove_block(dom))
             )
