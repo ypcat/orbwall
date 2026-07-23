@@ -439,10 +439,14 @@ async def _socks5_serve(
                 await writer.drain()
             return  # peeked path: client sees TCP RST
 
-        # Connect to real destination and relay.
+        # Connect to real destination and relay. Dial effective_host (the
+        # peeked SNI/Host hostname when available) rather than the raw IP:
+        # the VM may pick an IPv6 literal the host can't route, and resolving
+        # the allowed hostname host-side also stops SNI≠IP allowlist bypass.
         try:
-            remote_r, remote_w = await asyncio.open_connection(host, port)
-        except Exception:
+            remote_r, remote_w = await asyncio.open_connection(effective_host, port)
+        except Exception as e:
+            print(f"OrbWall: connect failed {effective_host}:{port} — {e}", flush=True)
             return
         if buffered:
             remote_w.write(buffered)
